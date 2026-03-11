@@ -2,7 +2,7 @@ default: build
 
 build:
     go build -o active-scan .
-    codesign -s - active-scan
+    codesign -f -s - active-scan
 
 test:
     go test ./...
@@ -14,35 +14,14 @@ install: build
 
 enable: install
     @mkdir -p ~/Library/LaunchAgents
-    @cat > ~/Library/LaunchAgents/com.hegner123.active-scan.plist << 'PLIST'
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-        <key>Label</key>
-        <string>com.hegner123.active-scan</string>
-        <key>ProgramArguments</key>
-        <array>
-            <string>/usr/local/bin/active-scan</string>
-        </array>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>KeepAlive</key>
-        <true/>
-        <key>StandardOutPath</key>
-        <string>/tmp/active-scan.out.log</string>
-        <key>StandardErrorPath</key>
-        <string>/tmp/active-scan.err.log</string>
-    </dict>
-    </plist>
-    PLIST
+    cp com.hegner123.active-scan.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/com.hegner123.active-scan.plist
-    @echo "Enabled — active-scan will start on login and restart if stopped"
+    @echo "Enabled — starts on login, restarts if stopped"
 
 disable:
     -launchctl unload ~/Library/LaunchAgents/com.hegner123.active-scan.plist
     rm -f ~/Library/LaunchAgents/com.hegner123.active-scan.plist
-    @echo "Disabled — active-scan will no longer start on login"
+    @echo "Disabled"
 
 start:
     launchctl start com.hegner123.active-scan

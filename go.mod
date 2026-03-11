@@ -1,6 +1,6 @@
 module github.com/hegner123/active-scan
 
-go 1.22
+go 1.24.0
 
 require fyne.io/systray v1.12.0
 
