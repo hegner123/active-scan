@@ -69,11 +69,12 @@ func onReady(ctx context.Context, cancel context.CancelFunc, state *State) {
 				case state.scanCount == 0:
 					mStatus.SetTitle("Status: starting...")
 					mLastScan.SetTitle("Last scan: never")
-				case state.totalAlerts == 0:
-					mStatus.SetTitle("Status: Clean")
+				case len(state.results) > 0 && !state.results[0].Clean:
+					active := len(state.results[0].Detections)
+					mStatus.SetTitle(fmt.Sprintf("Status: %d active threat(s)", active))
 					mLastScan.SetTitle(fmt.Sprintf("Last scan: %s ago", time.Since(state.lastScanTime).Round(time.Second)))
 				default:
-					mStatus.SetTitle(fmt.Sprintf("Status: %d threat(s) detected", state.totalAlerts))
+					mStatus.SetTitle("Status: Clean")
 					mLastScan.SetTitle(fmt.Sprintf("Last scan: %s ago", time.Since(state.lastScanTime).Round(time.Second)))
 				}
 				state.mu.RUnlock()
@@ -106,4 +107,3 @@ func openBrowser(url string) {
 		exec.Command("xdg-open", url).Start()
 	}
 }
-

@@ -136,6 +136,9 @@ tbody tr:hover { background: #161b22; }
 .action-killed { color: #f85149; font-weight: 600; }
 .action-notified { color: #d29922; }
 
+.status-detected { color: #f85149; font-weight: 600; }
+.status-resolved { color: #3fb950; font-weight: 600; }
+
 .empty-state {
   text-align: center;
   padding: 48px 0;
@@ -176,6 +179,11 @@ tbody tr:hover { background: #161b22; }
   opacity: 1;
   transform: translateX(0);
 }
+.toast.resolved {
+  background: #0d2818;
+  color: #3fb950;
+  border-color: #238636;
+}
 
 @media (max-width: 640px) {
   .stats { grid-template-columns: repeat(2, 1fr); }
@@ -212,7 +220,7 @@ tbody tr:hover { background: #161b22; }
     <button class="btn primary" id="scan-btn" onclick="triggerScan()">Scan Now</button>
   </div>
 
-  <div class="section-title">Detection History</div>
+  <div class="section-title">Threat Events</div>
   <div class="history-container">
     <table>
       <thead>
@@ -221,6 +229,7 @@ tbody tr:hover { background: #161b22; }
           <th style="width:100px">Category</th>
           <th>Detail</th>
           <th style="width:80px">Action</th>
+          <th style="width:80px">Status</th>
         </tr>
       </thead>
       <tbody id="history-body">
@@ -252,8 +261,8 @@ function renderStatus(data) {
     lastScan.textContent = ago;
   }
 
-  if ((data.totalAlerts || 0) > 0) {
-    badge.textContent = 'Threats';
+  if ((data.activeThreats || 0) > 0) {
+    badge.textContent = data.activeThreats + ' Active';
     badge.className = 'badge threat';
   } else if ((data.scanCount || 0) > 0) {
     badge.textContent = 'Clean';
@@ -264,30 +273,25 @@ function renderStatus(data) {
   }
 }
 
-function renderHistory(results) {
-  const detections = [];
-  for (const r of results) {
-    for (const d of (r.detections || [])) {
-      detections.push(d);
-    }
-  }
-
-  if (detections.length === 0) {
+function renderHistory(events) {
+  if (!events || events.length === 0) {
     emptyState.style.display = 'block';
     historyBody.innerHTML = '';
     return;
   }
 
   emptyState.style.display = 'none';
-  historyBody.innerHTML = detections.map(d => {
+  historyBody.innerHTML = events.map(d => {
     const time = new Date(d.time).toLocaleString();
     const catClass = 'cat-' + d.category;
     const actionClass = d.action === 'killed' ? 'action-killed' : 'action-notified';
+    const statusClass = 'status-' + (d.status || 'detected');
     return `<tr>
       <td>${esc(time)}</td>
       <td class="${catClass}">${esc(d.category)}</td>
       <td>${esc(d.detail)}</td>
       <td class="${actionClass}">${esc(d.action)}</td>
+      <td class="${statusClass}">${esc(d.status || 'detected')}</td>
     </tr>`;
   }).join('');
 }
@@ -308,10 +312,10 @@ function esc(s) {
   return d.innerHTML;
 }
 
-function showToast(message) {
+function showToast(message, style) {
   const container = document.getElementById('toasts');
   const toast = document.createElement('div');
-  toast.className = 'toast';
+  toast.className = 'toast' + (style ? ' ' + style : '');
   toast.textContent = message;
   container.appendChild(toast);
   requestAnimationFrame(() => toast.classList.add('show'));
@@ -338,7 +342,7 @@ async function triggerScan() {
 
 async function fetchHistory() {
   try {
-    const res = await fetch('/api/history');
+    const res = await fetch('/api/threats');
     const data = await res.json();
     renderHistory(data);
   } catch {}
@@ -361,6 +365,14 @@ function connect() {
       const d = JSON.parse(e.data);
       showToast(d.category + ': ' + d.detail);
     } catch {}
+  });
+
+  es.addEventListener('resolved', (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      showToast('Resolved: ' + d.detail, 'resolved');
+    } catch {}
+    fetchHistory();
   });
 
   es.onerror = () => {

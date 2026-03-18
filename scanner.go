@@ -32,6 +32,15 @@ type ScanResult struct {
 	Clean      bool        `json:"clean"`
 }
 
+type ThreatEvent struct {
+	Time     time.Time `json:"time"`
+	Category string    `json:"category"`
+	Detail   string    `json:"detail"`
+	Action   string    `json:"action"`
+	PID      int       `json:"pid,omitempty"`
+	Status   string    `json:"status"` // "detected" or "resolved"
+}
+
 // --- State ---
 
 type State struct {
@@ -44,6 +53,7 @@ type State struct {
 	totalKills   int
 	totalAlerts  int
 	scanCount    int
+	threatLog    []ThreatEvent
 
 	subMu       sync.RWMutex
 	subscribers map[chan string]struct{}
@@ -98,6 +108,15 @@ func (s *State) publishEvent(eventType string, data any) {
 
 func (s *State) addResult(r ScanResult) {
 	s.mu.Lock()
+
+	// Capture previous state before prepending
+	prevHadThreats := len(s.results) > 0 && !s.results[0].Clean
+	var prevDetections []Detection
+	if prevHadThreats {
+		prevDetections = make([]Detection, len(s.results[0].Detections))
+		copy(prevDetections, s.results[0].Detections)
+	}
+
 	s.results = append([]ScanResult{r}, s.results...)
 	if len(s.results) > 1000 {
 		s.results = s.results[:1000]
@@ -110,21 +129,64 @@ func (s *State) addResult(r ScanResult) {
 			s.totalKills++
 		}
 	}
+
+	// Record detection events
+	for _, d := range r.Detections {
+		s.threatLog = append([]ThreatEvent{{
+			Time:     d.Time,
+			Category: d.Category,
+			Detail:   d.Detail,
+			Action:   d.Action,
+			PID:      d.PID,
+			Status:   "detected",
+		}}, s.threatLog...)
+	}
+
+	// Record resolution events when previous scan had threats and current is clean
+	var resolved []ThreatEvent
+	if r.Clean && prevHadThreats {
+		for _, d := range prevDetections {
+			evt := ThreatEvent{
+				Time:     r.Time,
+				Category: d.Category,
+				Detail:   d.Detail,
+				Action:   d.Action,
+				PID:      d.PID,
+				Status:   "resolved",
+			}
+			s.threatLog = append([]ThreatEvent{evt}, s.threatLog...)
+			resolved = append(resolved, evt)
+		}
+	}
+
+	if len(s.threatLog) > 1000 {
+		s.threatLog = s.threatLog[:1000]
+	}
+
 	s.mu.Unlock()
 
 	s.publishEvent("status", s.Status())
+	for _, evt := range resolved {
+		s.publishEvent("resolved", evt)
+	}
 }
 
 func (s *State) Status() map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	activeThreats := 0
+	if len(s.results) > 0 && !s.results[0].Clean {
+		activeThreats = len(s.results[0].Detections)
+	}
+
 	status := map[string]any{
-		"scanCount":   s.scanCount,
-		"totalKills":  s.totalKills,
-		"totalAlerts": s.totalAlerts,
-		"interval":    s.interval.Seconds(),
-		"lastScan":    s.lastScanTime,
+		"scanCount":     s.scanCount,
+		"totalKills":    s.totalKills,
+		"totalAlerts":   s.totalAlerts,
+		"activeThreats": activeThreats,
+		"interval":      s.interval.Seconds(),
+		"lastScan":      s.lastScanTime,
 	}
 	if len(s.results) > 0 {
 		status["lastResult"] = s.results[0]
@@ -141,6 +203,18 @@ func (s *State) History(limit int) []ScanResult {
 	}
 	out := make([]ScanResult, limit)
 	copy(out, s.results[:limit])
+	return out
+}
+
+func (s *State) ThreatLog(limit int) []ThreatEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 || limit > len(s.threatLog) {
+		limit = len(s.threatLog)
+	}
+	out := make([]ThreatEvent, limit)
+	copy(out, s.threatLog[:limit])
 	return out
 }
 

@@ -35,6 +35,11 @@ func RunServer(ctx context.Context, state *State) {
 		json.NewEncoder(w).Encode(state.History(100))
 	})
 
+	mux.HandleFunc("GET /api/threats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(state.ThreatLog(200))
+	})
+
 	mux.HandleFunc("POST /api/scan", func(w http.ResponseWriter, r *http.Request) {
 		state.TriggerScan()
 		w.WriteHeader(http.StatusAccepted)
