@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,13 @@ import (
 )
 
 func main() {
+	// Handle service subcommands (install/uninstall) before flag parsing
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		if handleServiceCommand(os.Args[1], os.Args[2:]) {
+			return
+		}
+	}
+
 	port := flag.Int("port", 9847, "dashboard port")
 	interval := flag.Int("interval", 30, "scan interval in seconds")
 	flag.Parse()
@@ -23,6 +31,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	state := NewState(time.Duration(*interval)*time.Second, *port)
 
+	// Windows Service mode: no systray, SCM handles lifecycle
+	if isWindowsService() {
+		runWindowsService(ctx, cancel, state)
+		return
+	}
+
+	// Interactive mode: systray + signal handling
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -105,5 +120,7 @@ func openBrowser(url string) {
 		exec.Command("open", url).Start()
 	case "linux":
 		exec.Command("xdg-open", url).Start()
+	case "windows":
+		exec.Command("cmd", "/c", "start", url).Start()
 	}
 }

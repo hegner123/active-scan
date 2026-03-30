@@ -4,6 +4,15 @@ build:
     go build -o active-scan .
     codesign -f -s - active-scan
 
+build-windows:
+    GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o active-scan-amd64.exe .
+
+build-windows-arm:
+    GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -o active-scan-arm64.exe .
+
+build-linux:
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o active-scan-linux .
+
 test:
     go test ./...
 
@@ -36,4 +45,4 @@ logs:
     tail -f /tmp/active-scan.err.log
 
 clean:
-    rm -f active-scan
+    rm -f active-scan active-scan-amd64.exe active-scan-arm64.exe active-scan-linux
