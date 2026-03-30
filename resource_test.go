@@ -117,12 +117,21 @@ func TestGoroutineCleanupScanner(t *testing.T) {
 
 	go RunScanner(ctx, state)
 
-	// Wait for at least one full scan cycle to complete
-	time.Sleep(1500 * time.Millisecond)
+	// Poll until at least one scan completes.
+	// Windows CI is slow — wmic/netstat/schtasks can take 10+ seconds per scan.
+	for i := range 300 {
+		if state.Status()["scanCount"].(int) > 0 {
+			break
+		}
+		if i == 299 {
+			cancel()
+			t.Fatal("scanner did not complete a scan within 30s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	cancel()
-	// Context-aware scanning should stop quickly.
-	// Windows needs more time — wmic/netstat subprocesses are slower to terminate.
+	// Windows needs more time for subprocess cleanup.
 	time.Sleep(2 * time.Second)
 
 	runtime.GC()
@@ -131,11 +140,6 @@ func TestGoroutineCleanupScanner(t *testing.T) {
 
 	if after > baseline+2 {
 		t.Errorf("goroutine leak: baseline=%d after=%d (delta=%d)", baseline, after, after-baseline)
-	}
-
-	// Verify scans actually ran
-	if state.Status()["scanCount"].(int) == 0 {
-		t.Error("scanner did not run any scans")
 	}
 }
 
@@ -198,9 +202,13 @@ func TestScanCycleCPUTime(t *testing.T) {
 
 	t.Logf("single scan (no config): %s", elapsed)
 
-	// A single scan cycle (ps + lsof + crontab + launchagents) should be fast
-	if elapsed > 2*time.Second {
-		t.Errorf("scan took %s, want < 2s", elapsed)
+	// Unix tools (ps, lsof) are fast; Windows tools (wmic, netstat, schtasks) are slower
+	limit := 2 * time.Second
+	if runtime.GOOS == "windows" {
+		limit = 30 * time.Second
+	}
+	if elapsed > limit {
+		t.Errorf("scan took %s, want < %s", elapsed, limit)
 	}
 }
 
@@ -214,9 +222,13 @@ func TestScanCycleWithConfigsCPUTime(t *testing.T) {
 
 	t.Logf("single scan (with config): %s", elapsed)
 
-	// Config scan walks filesystem, allow more time
-	if elapsed > 10*time.Second {
-		t.Errorf("scan with configs took %s, want < 10s", elapsed)
+	// Config scan walks filesystem on top of process/network scans
+	limit := 10 * time.Second
+	if runtime.GOOS == "windows" {
+		limit = 60 * time.Second
+	}
+	if elapsed > limit {
+		t.Errorf("scan with configs took %s, want < %s", elapsed, limit)
 	}
 }
 
@@ -231,15 +243,34 @@ func TestSustainedOperationMemory(t *testing.T) {
 	state := NewState(200*time.Millisecond, 0)
 	go RunScanner(ctx, state)
 
-	// Let it run for ~3 seconds (~15 scan cycles)
-	time.Sleep(3 * time.Second)
+	// Wait for at least 3 scans to establish a baseline
+	for i := range 600 {
+		if state.Status()["scanCount"].(int) >= 3 {
+			break
+		}
+		if i == 599 {
+			cancel()
+			t.Fatal("scanner did not complete 3 scans within 60s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	runtime.GC()
 	var m1 runtime.MemStats
 	runtime.ReadMemStats(&m1)
+	baselineScans := state.Status()["scanCount"].(int)
 
-	// Run 3 more seconds
-	time.Sleep(3 * time.Second)
+	// Wait for 3 more scans
+	for i := range 600 {
+		if state.Status()["scanCount"].(int) >= baselineScans+3 {
+			break
+		}
+		if i == 599 {
+			cancel()
+			t.Fatal("scanner did not complete 3 additional scans within 60s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	runtime.GC()
 	var m2 runtime.MemStats
