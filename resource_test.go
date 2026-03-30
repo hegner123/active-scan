@@ -121,8 +121,9 @@ func TestGoroutineCleanupScanner(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 
 	cancel()
-	// Context-aware scanning should stop quickly
-	time.Sleep(500 * time.Millisecond)
+	// Context-aware scanning should stop quickly.
+	// Windows needs more time — wmic/netstat subprocesses are slower to terminate.
+	time.Sleep(2 * time.Second)
 
 	runtime.GC()
 	after := runtime.NumGoroutine()
