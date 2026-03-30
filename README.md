@@ -15,15 +15,33 @@ Detected malicious processes are killed automatically. Everything else is report
 
 ## Installation
 
+Download the latest binary from the [releases page](https://github.com/hegner123/active-scan/releases/latest), or build from source.
+
+| Platform | Binary |
+|----------|--------|
+| macOS Intel | `active-scan-darwin-amd64` |
+| macOS Apple Silicon | `active-scan-darwin-arm64` |
+| Linux x86_64 | `active-scan-linux-amd64` |
+| Linux ARM64 | `active-scan-linux-arm64` |
+| Windows x86_64 | `active-scan-windows-amd64.exe` |
+| Windows ARM64 | `active-scan-windows-arm64.exe` |
+
 ### macOS
 
-Requires [just](https://github.com/casey/just) and Go 1.22+.
+```bash
+# Download (Apple Silicon — use darwin-amd64 for Intel)
+curl -LO https://github.com/hegner123/active-scan/releases/latest/download/active-scan-darwin-arm64
+chmod +x active-scan-darwin-arm64
+
+# Run directly
+./active-scan-darwin-arm64
+```
+
+To install as a LaunchAgent (starts on login, restarts if stopped):
 
 ```bash
-# Build and install to /usr/local/bin
+# Requires just and Go 1.22+ (builds from source)
 just install
-
-# Enable as a LaunchAgent (starts on login, restarts if stopped)
 just enable
 ```
 
@@ -39,15 +57,12 @@ just logs       # Tail stderr log
 
 ### Windows
 
-Requires Go 1.22+. Build from source or download a release binary.
-
 ```powershell
-# Build
-go build -o active-scan.exe .
+# Download (x86_64 — use windows-arm64.exe for ARM)
+Invoke-WebRequest -Uri "https://github.com/hegner123/active-scan/releases/latest/download/active-scan-windows-amd64.exe" -OutFile "active-scan.exe"
 
-# Or cross-compile from macOS/Linux
-just build-windows       # amd64
-just build-windows-arm   # arm64
+# Run directly
+.\active-scan.exe
 ```
 
 Install as a Windows Service (run as Administrator):
@@ -74,11 +89,20 @@ The service runs headlessly (no system tray). The web dashboard is still availab
 ### Linux
 
 ```bash
-# Build
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o active-scan .
+# Download (x86_64 — use linux-arm64 for ARM)
+curl -LO https://github.com/hegner123/active-scan/releases/latest/download/active-scan-linux-amd64
+chmod +x active-scan-linux-amd64
 
 # Run directly
-./active-scan
+./active-scan-linux-amd64
+```
+
+### Build from source
+
+Requires Go 1.22+.
+
+```bash
+go build -o active-scan .
 ```
 
 ## Usage

@@ -1,5 +1,6 @@
 # Go
 active-scan
+dist/
 *.exe
 *.exe~
 *.dll
