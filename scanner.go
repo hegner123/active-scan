@@ -241,6 +241,44 @@ var persistKeywords = []string{"trongrid", "binance"}
 
 var configMarkers = []string{`global["!"]`, "_$_c266", "fromCharCode(127)"}
 
+var configFileExtensions = []string{".js", ".mjs", ".cjs", ".ts"}
+
+// isBuildConfigFile reports whether name looks like a JS/TS build-pipeline
+// config file (e.g. next.config.js, postcss.config.js, tailwind.config.mjs).
+// The check is case-insensitive and pattern-based, not a fixed filename list,
+// so payloads that rotate between config files (next.config -> postcss.config)
+// remain in scope.
+func isBuildConfigFile(name string) bool {
+	lower := strings.ToLower(name)
+	var hasExt bool
+	for _, ext := range configFileExtensions {
+		if strings.HasSuffix(lower, ext) {
+			hasExt = true
+			break
+		}
+	}
+	if !hasExt {
+		return false
+	}
+	return strings.Index(lower, ".config.") > 0
+}
+
+// matchWalletString returns the longest walletStrings entry contained in s.
+// Longest-match avoids substring collisions between overlapping entries
+// (e.g. "C5-022526" contains "5-022526"), so list order does not matter.
+func matchWalletString(s string) (string, bool) {
+	var best string
+	for _, w := range walletStrings {
+		if strings.Contains(s, w) && len(w) > len(best) {
+			best = w
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
+}
+
 // --- Matching (testable, pure functions) ---
 
 type processHit struct {
@@ -255,23 +293,32 @@ type networkHit struct {
 	Dest string
 }
 
+// matchProcessCmd is intentionally NOT scoped to "node" processes.  The
+// indicator strings here (global[, _V=-22, Gez() and the wallet/campaign
+// list) are specific enough that we apply them to every process command
+// line; this catches the malware even when its binary has been renamed
+// or run via npx/bun/deno/tsx.
 func matchProcessCmd(cmd string) (string, bool) {
 	switch {
 	case strings.Contains(cmd, "-e") && strings.Contains(cmd, "global["):
-		return "node eval with global[] access", true
+		return "eval with global[] access", true
 	case strings.Contains(cmd, "_V") && strings.Contains(cmd, "=-22"):
-		return "node with _V=-22 signature", true
+		return "_V=-22 signature in command", true
 	case strings.Contains(cmd, "Gez("):
-		return "node with Gez() call", true
+		return "Gez() call in command", true
+	}
+	if w, ok := matchWalletString(cmd); ok {
+		return "wallet/campaign id in command: " + w, true
 	}
 	return "", false
 }
 
+// matchNetworkLine matches any process line with a known C2 host substring.
+// The "node" pre-filter that used to live here was deliberately removed:
+// a renamed loader binary (or one launched via npx/bun/deno) still calls
+// the same C2 endpoints, and we want those caught.
 func matchNetworkLine(line string) (string, bool) {
 	lower := strings.ToLower(line)
-	if !strings.Contains(lower, "node") {
-		return "", false
-	}
 	for _, host := range c2Hosts {
 		if strings.Contains(lower, strings.ToLower(host)) {
 			return host, true
@@ -285,10 +332,25 @@ func matchPersistenceLine(line string) (string, bool) {
 	if strings.Contains(lower, "node") && strings.Contains(lower, "-e") {
 		return "node -e", true
 	}
+	if strings.Contains(lower, "curl") {
+		if strings.Contains(lower, "| sh") || strings.Contains(lower, "|sh") ||
+			strings.Contains(lower, "| bash") || strings.Contains(lower, "|bash") {
+			return "curl | sh", true
+		}
+	}
+	if strings.Contains(lower, "wget") {
+		if strings.Contains(lower, "| sh") || strings.Contains(lower, "|sh") ||
+			strings.Contains(lower, "| bash") || strings.Contains(lower, "|bash") {
+			return "wget | sh", true
+		}
+	}
 	for _, kw := range persistKeywords {
 		if strings.Contains(lower, kw) {
 			return kw, true
 		}
+	}
+	if w, ok := matchWalletString(line); ok {
+		return "wallet/campaign id: " + w, true
 	}
 	return "", false
 }
@@ -299,7 +361,80 @@ func matchConfigContent(content string) (string, bool) {
 			return marker, true
 		}
 	}
+	if w, ok := matchWalletString(content); ok {
+		return "wallet/campaign id: " + w, true
+	}
 	return "", false
+}
+
+// --- Persistence content matching (shared across platforms) ---
+
+// scanContentForPersistence emits detections for known indicators found
+// in content.  identifier is included in the Detail string (typically a
+// file path or login-item name).  Each indicator class emits at most one
+// Detection; persistKeywords stops at the first match.
+func scanContentForPersistence(content, descriptor, identifier string) []Detection {
+	lower := strings.ToLower(content)
+	var detections []Detection
+
+	if strings.Contains(lower, "node") && strings.Contains(lower, "-e") {
+		detections = append(detections, Detection{
+			Time:     time.Now(),
+			Category: "persistence",
+			Detail:   fmt.Sprintf("%s %s contains 'node -e'", descriptor, identifier),
+			Action:   "notified",
+		})
+	}
+	if strings.Contains(lower, "curl") &&
+		(strings.Contains(lower, "| sh") || strings.Contains(lower, "|sh") ||
+			strings.Contains(lower, "| bash") || strings.Contains(lower, "|bash")) {
+		detections = append(detections, Detection{
+			Time:     time.Now(),
+			Category: "persistence",
+			Detail:   fmt.Sprintf("%s %s contains 'curl | sh' style pipe", descriptor, identifier),
+			Action:   "notified",
+		})
+	}
+	for _, kw := range persistKeywords {
+		if strings.Contains(lower, kw) {
+			detections = append(detections, Detection{
+				Time:     time.Now(),
+				Category: "persistence",
+				Detail:   fmt.Sprintf("%s %s contains '%s'", descriptor, identifier, kw),
+				Action:   "notified",
+			})
+			break
+		}
+	}
+	if w, ok := matchWalletString(content); ok {
+		detections = append(detections, Detection{
+			Time:     time.Now(),
+			Category: "persistence",
+			Detail:   fmt.Sprintf("%s %s contains wallet/campaign id '%s'", descriptor, identifier, w),
+			Action:   "notified",
+		})
+	}
+	if marker, ok := matchConfigContent(content); ok && !strings.HasPrefix(marker, "wallet/campaign id") {
+		detections = append(detections, Detection{
+			Time:     time.Now(),
+			Category: "persistence",
+			Detail:   fmt.Sprintf("%s %s contains JS payload marker '%s'", descriptor, identifier, marker),
+			Action:   "notified",
+		})
+	}
+
+	return detections
+}
+
+// scanFileForPersistence reads path and delegates to
+// scanContentForPersistence.  Missing files are silently skipped so this
+// is safe to call against an opportunistic path list.
+func scanFileForPersistence(path, descriptor string) []Detection {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return scanContentForPersistence(string(data), descriptor, path)
 }
 
 // --- Scanner ---
@@ -312,15 +447,13 @@ func RunScanner(ctx context.Context, state *State) {
 	ticker := time.NewTicker(state.interval)
 	defer ticker.Stop()
 
-	configCycle := 0
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("scanner stopped")
 			return
 		case <-ticker.C:
-			configCycle++
-			runScan(ctx, state, configCycle%10 == 0)
+			runScan(ctx, state, true)
 		case <-state.scanNow:
 			runScan(ctx, state, true)
 		}
@@ -345,6 +478,7 @@ func runScan(ctx context.Context, state *State, includeConfigs bool) {
 	}
 	if includeConfigs {
 		detections = append(detections, scanConfigs(ctx)...)
+		detections = append(detections, scanGitHooks(ctx)...)
 	}
 
 	result := ScanResult{
@@ -403,7 +537,7 @@ func scanConfigs(ctx context.Context) []Detection {
 				return nil
 			}
 
-			if !strings.HasPrefix(d.Name(), "next.config.") {
+			if !isBuildConfigFile(d.Name()) && d.Name() != "package.json" {
 				return nil
 			}
 
@@ -411,24 +545,90 @@ func scanConfigs(ctx context.Context) []Detection {
 			if err != nil {
 				return nil
 			}
-			content := string(data)
 
-			for _, marker := range configMarkers {
-				if strings.Contains(content, marker) {
-					detections = append(detections, Detection{
-						Time:     time.Now(),
-						Category: "config",
-						Detail:   fmt.Sprintf("infected config: %s (marker: %s)", path, marker),
-						Action:   "notified",
-					})
-					break
-				}
+			if marker, matched := matchConfigContent(string(data)); matched {
+				detections = append(detections, Detection{
+					Time:     time.Now(),
+					Category: "config",
+					Detail:   fmt.Sprintf("infected config: %s (marker: %s)", path, marker),
+					Action:   "notified",
+				})
 			}
 
 			return nil
 		})
 	}
 
+	return detections
+}
+
+// scanGitHooksInDir walks one root directory looking for executable
+// hooks under <repo>/.git/hooks/.  Hooks are a classic persistence
+// surface: a malicious post-checkout or pre-commit hook runs every
+// time git operates on the repo.  Git's bundled sample hooks have a
+// .sample suffix and are not executed, so they're skipped.
+func scanGitHooksInDir(ctx context.Context, root string) []Detection {
+	var detections []Detection
+	skipDirs := map[string]bool{
+		"node_modules": true, "vendor": true, ".next": true,
+	}
+
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || ctx.Err() != nil {
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			rel, _ := filepath.Rel(root, path)
+			if strings.Count(rel, string(os.PathSeparator)) > 6 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		parent := filepath.Base(filepath.Dir(path))
+		grandparent := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		if parent != "hooks" || grandparent != ".git" {
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".sample") {
+			return nil
+		}
+
+		detections = append(detections, scanFileForPersistence(path, "git hook")...)
+		return nil
+	})
+
+	return detections
+}
+
+// scanGitHooks scans the standard developer code directories under the
+// user's home for malicious git hooks.  See scanGitHooksInDir.
+func scanGitHooks(ctx context.Context) []Detection {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	scanDirs := []string{
+		filepath.Join(home, "Documents"),
+		filepath.Join(home, "projects"),
+		filepath.Join(home, "code"),
+		filepath.Join(home, "Code"),
+		filepath.Join(home, "repos"),
+		filepath.Join(home, "src"),
+		filepath.Join(home, "dev"),
+	}
+
+	var detections []Detection
+	for _, dir := range scanDirs {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		detections = append(detections, scanGitHooksInDir(ctx, dir)...)
+	}
 	return detections
 }
 

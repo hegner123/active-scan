@@ -62,9 +62,11 @@ func parseProcessOutput(output string, myPID int) []processHit {
 	return hits
 }
 
-// parseNetworkOutput parses netstat -nao output and cross-references with
-// a set of known node.exe PIDs to find C2 connections.
-func parseNetworkOutput(output string, nodePIDs map[int]bool) []networkHit {
+// parseNetworkOutput parses netstat -nao output for any connection whose
+// foreign address contains a known C2 host substring.  The node.exe PID
+// cross-reference that used to live here was removed: a renamed loader
+// binary still calls the same endpoints, and we want it flagged.
+func parseNetworkOutput(output string) []networkHit {
 	var hits []networkHit
 	s := bufio.NewScanner(strings.NewReader(output))
 	for s.Scan() {
@@ -75,12 +77,13 @@ func parseNetworkOutput(output string, nodePIDs map[int]bool) []networkHit {
 			continue
 		}
 		pid, err := strconv.Atoi(fields[4])
-		if err != nil || !nodePIDs[pid] {
+		if err != nil {
 			continue
 		}
 		foreignAddr := fields[2]
+		lowerAddr := strings.ToLower(foreignAddr)
 		for _, host := range c2Hosts {
-			if strings.Contains(strings.ToLower(foreignAddr), strings.ToLower(host)) {
+			if strings.Contains(lowerAddr, strings.ToLower(host)) {
 				hits = append(hits, networkHit{PID: pid, Host: host, Dest: foreignAddr})
 				break
 			}
@@ -92,7 +95,10 @@ func parseNetworkOutput(output string, nodePIDs map[int]bool) []networkHit {
 // --- Platform Scan Functions ---
 
 func scanProcesses(ctx context.Context) []Detection {
-	out, err := exec.CommandContext(ctx, "wmic", "process", "where", "name='node.exe'",
+	// Query ALL processes (no name filter); matchProcessCmd does the
+	// signature work.  Without this, a renamed loader (or one launched
+	// via npx/bun/deno/tsx) slips past detection.
+	out, err := exec.CommandContext(ctx, "wmic", "process",
 		"get", "ProcessId,CommandLine", "/value").Output()
 	if err != nil {
 		return nil
@@ -118,33 +124,16 @@ func scanProcesses(ctx context.Context) []Detection {
 }
 
 func scanNetwork(ctx context.Context) []Detection {
-	// Step 1: Identify node.exe PIDs
-	procOut, err := exec.CommandContext(ctx, "wmic", "process", "where", "name='node.exe'",
-		"get", "ProcessId", "/value").Output()
-	if err != nil {
-		return nil
-	}
-	nodePIDs := make(map[int]bool)
-	for _, line := range strings.Split(string(procOut), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ProcessId=") {
-			pid, parseErr := strconv.Atoi(strings.TrimPrefix(line, "ProcessId="))
-			if parseErr == nil {
-				nodePIDs[pid] = true
-			}
-		}
-	}
-	if len(nodePIDs) == 0 {
-		return nil
-	}
-
-	// Step 2: Get network connections
+	// Connection-side detection only.  The previous two-stage approach
+	// (identify node.exe PIDs first, then cross-reference) missed any
+	// renamed loader.  Now any process talking to a known C2 host gets
+	// flagged regardless of its binary name.
 	netOut, err := exec.CommandContext(ctx, "netstat", "-nao").Output()
 	if err != nil {
 		return nil
 	}
 
-	hits := parseNetworkOutput(string(netOut), nodePIDs)
+	hits := parseNetworkOutput(string(netOut))
 	var detections []Detection
 	for _, h := range hits {
 		action := "killed"

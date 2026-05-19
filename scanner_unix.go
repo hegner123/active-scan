@@ -18,23 +18,39 @@ import (
 
 // --- Output Parsers ---
 
+// parseProcessOutput parses the output of:
+//
+//	ps -wwaxo pid=,user=,command=
+//
+// The "=" suffix on each column suppresses the header row, and -ww
+// disables command-line truncation.  Format per row:
+//
+//	<pid> <user> <command and args...>
+//
+// We do NOT pre-filter by binary name.  Every process line is fed to
+// matchProcessCmd; only the self-exclusion check survives.
 func parseProcessOutput(output string, myPID int) []processHit {
 	var hits []processHit
 	s := bufio.NewScanner(strings.NewReader(output))
+	// Long obfuscated payloads can blow past bufio's default 64KB line cap.
+	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for s.Scan() {
 		line := s.Text()
-		if !strings.Contains(line, "node") || strings.Contains(line, "active-scan") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.Contains(line, "active-scan") {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 11 {
+		if len(fields) < 3 {
 			continue
 		}
-		pid, err := strconv.Atoi(fields[1])
+		pid, err := strconv.Atoi(fields[0])
 		if err != nil || pid == myPID {
 			continue
 		}
-		cmd := strings.Join(fields[10:], " ")
+		cmd := strings.Join(fields[2:], " ")
 		reason, matched := matchProcessCmd(cmd)
 		if !matched {
 			continue
@@ -73,7 +89,12 @@ func parseNetworkOutput(output string) []networkHit {
 // --- Platform Scan Functions ---
 
 func scanProcesses(ctx context.Context) []Detection {
-	out, err := exec.CommandContext(ctx, "ps", "aux").Output()
+	// -ww disables column truncation (default ps aux truncates COMMAND on
+	// macOS, hiding the long obfuscated payload that contains the markers
+	// we match on); -ax includes all processes including those without a
+	// controlling terminal; -o pid=,user=,command= gives us only the
+	// columns we need with no header row.
+	out, err := exec.CommandContext(ctx, "ps", "-wwaxo", "pid=,user=,command=").Output()
 	if err != nil {
 		return nil
 	}
@@ -122,80 +143,128 @@ func scanNetwork(ctx context.Context) []Detection {
 	return detections
 }
 
+// scanLaunchDir scans a launchd plist directory.  Skips active-scan's own
+// plist, skips directories, only reads files ending in .plist.
+func scanLaunchDir(dir, descriptor string) []Detection {
+	var detections []Detection
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		nameLower := strings.ToLower(entry.Name())
+		if !strings.HasSuffix(nameLower, ".plist") {
+			continue
+		}
+		if strings.Contains(nameLower, "activescan") || strings.Contains(nameLower, "active-scan") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		detections = append(detections, scanFileForPersistence(path, descriptor)...)
+	}
+	return detections
+}
+
 func scanPersistence() []Detection {
 	var detections []Detection
 
-	out, err := exec.Command("crontab", "-l").Output()
-	if err == nil {
+	// 1. User crontab.
+	if out, err := exec.Command("crontab", "-l").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
-			lower := strings.ToLower(line)
-			if strings.Contains(lower, "node") && strings.Contains(lower, "-e") {
+			if kw, matched := matchPersistenceLine(line); matched {
 				detections = append(detections, Detection{
 					Time:     time.Now(),
 					Category: "persistence",
-					Detail:   fmt.Sprintf("suspicious crontab: %s", truncate(line, 120)),
-					Action:   "notified",
-				})
-			}
-			for _, kw := range persistKeywords {
-				if strings.Contains(lower, kw) {
-					detections = append(detections, Detection{
-						Time:     time.Now(),
-						Category: "persistence",
-						Detail:   fmt.Sprintf("crontab contains '%s': %s", kw, truncate(line, 120)),
-						Action:   "notified",
-					})
-					break
-				}
-			}
-		}
-	}
-
-	// LaunchAgents check (macOS only, silently skipped on Linux)
-	if runtime.GOOS == "darwin" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return detections
-		}
-		laDir := filepath.Join(home, "Library", "LaunchAgents")
-		entries, err := os.ReadDir(laDir)
-		if err != nil {
-			return detections
-		}
-
-		for _, entry := range entries {
-			if entry.IsDir() || strings.Contains(entry.Name(), "activescan") {
-				continue
-			}
-			path := filepath.Join(laDir, entry.Name())
-			data, readErr := os.ReadFile(path)
-			if readErr != nil {
-				continue
-			}
-			content := strings.ToLower(string(data))
-
-			for _, kw := range persistKeywords {
-				if strings.Contains(content, kw) {
-					detections = append(detections, Detection{
-						Time:     time.Now(),
-						Category: "persistence",
-						Detail:   fmt.Sprintf("LaunchAgent '%s' contains '%s'", entry.Name(), kw),
-						Action:   "notified",
-					})
-					break
-				}
-			}
-			if strings.Contains(content, "node") && strings.Contains(content, "-e") {
-				detections = append(detections, Detection{
-					Time:     time.Now(),
-					Category: "persistence",
-					Detail:   fmt.Sprintf("LaunchAgent '%s' runs suspicious node command", entry.Name()),
+					Detail:   fmt.Sprintf("crontab contains '%s': %s", kw, truncate(line, 120)),
 					Action:   "notified",
 				})
 			}
 		}
 	}
 
+	if runtime.GOOS != "darwin" {
+		// 2. Linux-only: shell rc still applies, but no LaunchAgents.
+		detections = append(detections, scanUserConfigFiles()...)
+		return detections
+	}
+
+	// 3. macOS: LaunchAgents and LaunchDaemons, user + system-wide.
+	//    /Library/LaunchDaemons is where a "kill it and it comes back"
+	//    daemon would live, because launchd will respawn it under root.
+	home, err := os.UserHomeDir()
+	if err == nil {
+		detections = append(detections,
+			scanLaunchDir(filepath.Join(home, "Library", "LaunchAgents"), "user LaunchAgent")...)
+	}
+	detections = append(detections,
+		scanLaunchDir("/Library/LaunchAgents", "system LaunchAgent")...)
+	detections = append(detections,
+		scanLaunchDir("/Library/LaunchDaemons", "system LaunchDaemon")...)
+
+	// 4. Shell rc and other user config files.
+	detections = append(detections, scanUserConfigFiles()...)
+
+	// 5. macOS login items (binary plist; convert via plutil first).
+	detections = append(detections, scanLoginItems()...)
+
+	return detections
+}
+
+// scanLoginItems reads macOS's backgrounditems.btm (a binary plist that
+// records login items and background tasks), converts it to XML via
+// plutil, and scans the result for persistence indicators.  Silently
+// returns nil on Linux or when the file or plutil is unavailable.
+func scanLoginItems() []Detection {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(home, "Library", "Application Support",
+		"com.apple.backgroundtaskmanagementagent", "backgrounditems.btm")
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	out, err := exec.Command("plutil", "-convert", "xml1", "-o", "-", path).Output()
+	if err != nil {
+		return nil
+	}
+	return scanContentForPersistence(string(out), "macOS login item", path)
+}
+
+// scanUserConfigFiles checks shell startup files, npm config, and ssh
+// files for the persistence indicator set.  Each path is opportunistic;
+// non-existent files are silently skipped.
+func scanUserConfigFiles() []Detection {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	shellFiles := []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".zprofile"),
+		filepath.Join(home, ".zshenv"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".bash_profile"),
+		filepath.Join(home, ".profile"),
+	}
+	npmFile := filepath.Join(home, ".npmrc")
+	sshAuthKeys := filepath.Join(home, ".ssh", "authorized_keys")
+	sshConfig := filepath.Join(home, ".ssh", "config")
+
+	var detections []Detection
+	for _, p := range shellFiles {
+		detections = append(detections, scanFileForPersistence(p, "shell rc")...)
+	}
+	detections = append(detections, scanFileForPersistence(npmFile, "npm config")...)
+	detections = append(detections, scanFileForPersistence(sshAuthKeys, "ssh authorized_keys")...)
+	detections = append(detections, scanFileForPersistence(sshConfig, "ssh config")...)
 	return detections
 }
 

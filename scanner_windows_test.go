@@ -8,7 +8,9 @@ import (
 )
 
 func TestParseProcessOutput(t *testing.T) {
-	// wmic process /value format: Key=Value pairs separated by blank lines
+	// wmic process /value format: Key=Value pairs separated by blank lines.
+	// Now that wmic returns all processes (not just node.exe), the parser
+	// sees non-node binaries too; matchProcessCmd is the gate.
 	output := "\r\n" +
 		"CommandLine=node -e global[\"!\"] something malicious\r\n" +
 		"ProcessId=1234\r\n" +
@@ -21,33 +23,33 @@ func TestParseProcessOutput(t *testing.T) {
 		"\r\n" +
 		"CommandLine=node server.js Gez(encoded)\r\n" +
 		"ProcessId=3456\r\n" +
+		"\r\n" +
+		"CommandLine=C:\\Tools\\loader.exe -e global[\"!\"] payload\r\n" +
+		"ProcessId=4444\r\n" +
 		"\r\n"
 
 	hits := parseProcessOutput(output, 99999)
 
-	if len(hits) != 3 {
-		t.Fatalf("got %d hits, want 3", len(hits))
+	if len(hits) != 4 {
+		t.Fatalf("got %d hits, want 4", len(hits))
 	}
 
-	if hits[0].PID != 1234 {
-		t.Errorf("hit[0].PID = %d, want 1234", hits[0].PID)
+	expected := []struct {
+		pid    int
+		reason string
+	}{
+		{1234, "eval with global[] access"},
+		{9012, "_V=-22 signature in command"},
+		{3456, "Gez() call in command"},
+		{4444, "eval with global[] access"},
 	}
-	if hits[0].Reason != "node eval with global[] access" {
-		t.Errorf("hit[0].Reason = %q", hits[0].Reason)
-	}
-
-	if hits[1].PID != 9012 {
-		t.Errorf("hit[1].PID = %d, want 9012", hits[1].PID)
-	}
-	if hits[1].Reason != "node with _V=-22 signature" {
-		t.Errorf("hit[1].Reason = %q", hits[1].Reason)
-	}
-
-	if hits[2].PID != 3456 {
-		t.Errorf("hit[2].PID = %d, want 3456", hits[2].PID)
-	}
-	if hits[2].Reason != "node with Gez() call" {
-		t.Errorf("hit[2].Reason = %q", hits[2].Reason)
+	for i, want := range expected {
+		if hits[i].PID != want.pid {
+			t.Errorf("hit[%d].PID = %d, want %d", i, hits[i].PID, want.pid)
+		}
+		if hits[i].Reason != want.reason {
+			t.Errorf("hit[%d].Reason = %q, want %q", i, hits[i].Reason, want.reason)
+		}
 	}
 }
 
@@ -77,30 +79,33 @@ func TestParseProcessOutputEmpty(t *testing.T) {
 }
 
 func TestParseNetworkOutput(t *testing.T) {
-	// netstat -nao format
+	// netstat -nao format. No longer filtered by nodePIDs; any process
+	// connecting to a C2 host is flagged.
 	output := `
 Active Connections
 
   Proto  Local Address          Foreign Address        State           PID
   TCP    192.168.1.5:54321      136.0.9.8:8080         ESTABLISHED     1234
   TCP    192.168.1.5:54322      93.184.216.34:443      ESTABLISHED     5678
-  TCP    192.168.1.5:54323      1.2.3.4:443            ESTABLISHED     1234
+  TCP    192.168.1.5:54323      trongrid.io:443        ESTABLISHED     9999
 `
 
-	nodePIDs := map[int]bool{1234: true}
-	hits := parseNetworkOutput(output, nodePIDs)
+	hits := parseNetworkOutput(output)
 
-	if len(hits) != 1 {
-		t.Fatalf("got %d hits, want 1", len(hits))
+	if len(hits) != 2 {
+		t.Fatalf("got %d hits, want 2", len(hits))
 	}
 
 	if hits[0].PID != 1234 || hits[0].Host != "136.0.9.8" {
 		t.Errorf("hit[0] = {PID:%d Host:%q}, want {PID:1234 Host:136.0.9.8}", hits[0].PID, hits[0].Host)
 	}
+	if hits[1].PID != 9999 || hits[1].Host != "trongrid" {
+		t.Errorf("hit[1] = {PID:%d Host:%q}, want {PID:9999 Host:trongrid}", hits[1].PID, hits[1].Host)
+	}
 }
 
 func TestParseNetworkOutputEmpty(t *testing.T) {
-	hits := parseNetworkOutput("", nil)
+	hits := parseNetworkOutput("")
 	if len(hits) != 0 {
 		t.Errorf("empty input should return nil, got %d hits", len(hits))
 	}
